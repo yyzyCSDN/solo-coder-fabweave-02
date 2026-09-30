@@ -22,6 +22,7 @@ from fabweave.recipe.qualification import Qualification, qualification_decision
 from fabweave.reticle.reservation import Reservation, ReservationBook
 from fabweave.rework.authorization import ReworkPolicy, authorization_decision
 from fabweave.shipment.commit import Allocation, CommitLedger
+from fabweave.shipment.transfer import TransferLedger
 from fabweave.spc.control import western_electric_rules
 from fabweave.takt.monitor import TaktResult, takt_result
 from fabweave.yielding.rollup import StepYield, route_yield
@@ -260,3 +261,37 @@ def performance_summary(
     expected_steps: list[str],
 ) -> PerformanceSummary:
     return PerformanceSummary(takt_result(completions, window_start, window_end), route_yield(steps, expected_steps))
+
+
+def cross_factory_transfer(
+    ledger: TransferLedger,
+    transfer_id: str,
+    lot_id: str,
+    quantity: int,
+    event_ids: tuple[str, str, str, str],
+    times: tuple[int, int, int, int],
+    origin_factory: str,
+    destination_factory: str,
+    origin_graph: GenealogyGraph,
+    destination_graph: GenealogyGraph,
+    hold: HoldState | None = None,
+    expected_hold_version: int | None = None,
+    received_quantity: int | None = None,
+) -> Decision:
+    """Run the load -> depart -> arrive -> unload scan chain in order.
+
+    Stops at the first denied scan and returns that decision with its
+    reasons; a completed chain ends at ``unloaded``.
+    """
+
+    steps = (
+        lambda: ledger.load(transfer_id, lot_id, quantity, event_ids[0], times[0], origin_factory, destination_factory, origin_graph),
+        lambda: ledger.depart(transfer_id, event_ids[1], times[1], hold, expected_hold_version),
+        lambda: ledger.arrive(transfer_id, event_ids[2], times[2]),
+        lambda: ledger.unload(transfer_id, event_ids[3], times[3], destination_graph, received_quantity),
+    )
+    for step in steps:
+        decision = step()
+        if not decision.allowed:
+            return decision
+    return allow(transfer_id=transfer_id, stage="unloaded")
