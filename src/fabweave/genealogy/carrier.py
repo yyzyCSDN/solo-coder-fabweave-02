@@ -27,6 +27,10 @@ class GenealogyGraph:
         for node in self._parents:
             ancestry(self._parents, node)
 
+    def parents(self) -> dict[str, str | None]:
+        """返回 ``子载体 -> 父载体`` 映射的只读快照（根映射到 ``None``）。"""
+        return dict(self._parents)
+
     def related(self, start: str, direction: str, max_depth: int) -> tuple[str, ...]:
         if max_depth < 0 or direction not in {"upstream", "downstream"}:
             raise ValueError("invalid traversal request")

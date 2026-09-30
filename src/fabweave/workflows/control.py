@@ -8,6 +8,7 @@ from fabweave.cleanroom.excursion import active_excursion
 from fabweave.contamination.segregation import incompatible_pairs
 from fabweave.core.decision import Decision, allow, deny
 from fabweave.core.events import EventLog
+from fabweave.core.ids import deterministic_id
 from fabweave.core.timebox import TimeBox
 from fabweave.dedication.tool import DedicationPolicy, policy_decision
 from fabweave.dispatch.priority import DispatchCandidate, rank_candidates
@@ -24,6 +25,12 @@ from fabweave.rework.authorization import ReworkPolicy, authorization_decision
 from fabweave.shipment.commit import Allocation, CommitLedger
 from fabweave.spc.control import western_electric_rules
 from fabweave.takt.monitor import TaktResult, takt_result
+from fabweave.transfer.chain import (
+    STAGE_DEPART,
+    TransferState,
+    transfer_scan,
+    transfer_state,
+)
 from fabweave.yielding.rollup import StepYield, route_yield
 
 
@@ -244,6 +251,95 @@ def dedicated_qualification(
     dedication = policy_decision(product, tool_id, at, dedication_policies)
     qualification = qualification_decision(tool_id, chamber_id, recipe_revision, at, qualifications)
     return _combine([dedication, qualification])
+
+
+def departure_holds(
+    holds: dict[str, HoldState],
+    expected_versions: dict[str, int],
+    carriers: frozenset[str],
+    at: int,
+) -> tuple[dict[str, frozenset[str]], tuple[str, ...]]:
+    """出厂时刻仍处于活动状态的扣留。
+
+    复用扣留域的放行判断：版本过期、处置未完成、活动 blocker 都算活动扣留。
+    返回 ``(载体 -> 扣留标识集合, 细化原因)``，细化原因形如
+    ``missing_disposition:QA@C1``，保留扣留域给出的原始拒绝原因。
+    """
+    active: dict[str, frozenset[str]] = {}
+    reasons: list[str] = []
+    for carrier in sorted(carriers):
+        state = holds.get(carrier)
+        if state is None:
+            continue
+        expected = expected_versions.get(carrier, state.version)
+        decision = release_decision(state, expected, at)
+        if decision.allowed:
+            continue
+        active[carrier] = frozenset({state.hold_id})
+        reasons.extend(f"{reason}@{carrier}" for reason in decision.reasons)
+    return active, tuple(reasons)
+
+
+def record_transfer_scan(
+    log: EventLog,
+    shipment_id: str,
+    stage: str,
+    at: int,
+    carriers: list[str] | tuple[str, ...] = (),
+    holds: dict[str, HoldState] | None = None,
+    expected_hold_versions: dict[str, int] | None = None,
+    lineage: dict[str, str] | None = None,
+) -> Decision:
+    """跨厂转运扫描入口，出厂阶段接入活动扣留判断。
+
+    与 :func:`fabweave.transfer.chain.transfer_scan` 行为一致，但在出厂时
+    额外通过扣留域判断每个载体；有活动扣留则以
+    ``active_hold:<扣留标识>``（并附扣留域细化原因）拒绝，不写事件。
+    """
+    active_holds: dict[str, frozenset[str]] | None = None
+    hold_reasons: tuple[str, ...] = ()
+    if stage == STAGE_DEPART:
+        state = transfer_state(log, shipment_id)
+        active_holds, hold_reasons = departure_holds(
+            holds or {}, expected_hold_versions or {}, state.loaded_carriers, at
+        )
+    decision = transfer_scan(
+        log, shipment_id, stage, at, carriers, active_holds=active_holds, lineage=lineage
+    )
+    if decision.allowed:
+        return decision
+    if not any(reason.startswith("active_hold:") for reason in decision.reasons):
+        return decision
+    return deny(*decision.reasons, *hold_reasons, **dict(decision.evidence))
+
+
+def attach_transfer_lineage(
+    graph: GenealogyGraph,
+    state: TransferState,
+) -> GenealogyGraph:
+    """转运成功后把目的地载体接回原有物料谱系。
+
+    仅对卸载已完成（链完整）的转运生效。每条非同名谱系链接插入一个唯一的
+    转运段节点：``来源载体 -> XFER-<转运单>-<目的地载体> -> 目的地载体``，
+    因此沿目的地载体向上仍能追溯到转运前的全部祖先；同名直连不改动谱系。
+    重复接入同一条转运是幂等的；目的地载体已有不同父节点或接入后成环则报错。
+    """
+    if not state.complete:
+        raise ValueError("transfer chain is not complete")
+    parent_of = graph.parents()
+    for destination, origin in state.lineage_links:
+        if destination == origin:
+            # 同名直连：载体以原标识继续存在，谱系图保持原样即可。
+            parent_of.setdefault(destination, None)
+            continue
+        segment = deterministic_id("XFER", state.shipment_id, origin, destination, length=10)
+        if segment not in parent_of:
+            parent_of.setdefault(origin, None)
+            parent_of[segment] = origin
+        if parent_of.get(destination) not in (None, segment):
+            raise ValueError("destination carrier already attached to a different parent")
+        parent_of[destination] = segment
+    return GenealogyGraph(parent_of)
 
 
 @dataclass(frozen=True, slots=True)
